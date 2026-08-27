@@ -1,5 +1,9 @@
 import requests
 import time
+import json
+from pydantic import BaseModel, HttpUrl, ValidationError
+from typing import Optional
+
 from pathlib import Path
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -132,7 +136,7 @@ while catalogue_url and catalogue_pages_for_source < 3:
 for product_url in sorted(book_links):
 
     # Create a safe cache filename from the product URL
-    cache_name = product_url.rstrip("/").split("/")[-1] + ".html"
+    cache_name = product_url.rstrip("/").split("/")[-2] + ".html"
     cache_file = detail_cache_dir / cache_name
 
     html = get_page(product_url, cache_file)
@@ -186,12 +190,6 @@ for product_url in sorted(book_links):
         else None
     )
 
-    description = (
-        description_element.get_text(strip=True)
-        if description_element
-        else None
-    )
-
     # Provenance
     source_page = book_source_pages.get(product_url)
 
@@ -233,3 +231,120 @@ print(
     f"Records without description: "
     f"{sum(r['description'] is None for r in raw_records)}"
 )
+
+class Book(BaseModel):
+    title: str
+    product_url: HttpUrl
+    price_text: str
+    price_gbp: float
+    availability_text: Optional[str] = None
+    rating_text: Optional[str] = None
+    description: Optional[str] = None
+    source_page: Optional[HttpUrl] = None
+    fetched_at: str
+
+
+# -------------------------
+# Output directory
+# -------------------------
+
+OUTPUT_DIR = Path("output")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+books_file = OUTPUT_DIR / "books.json"
+errors_file = OUTPUT_DIR / "errors.json"
+
+
+valid_books = []
+errors = []
+
+# Product URL is the identity
+seen_urls = set()
+
+
+# -------------------------
+# Normalize + validate
+# -------------------------
+
+for raw in raw_records:
+
+    try:
+        # Get URL
+        product_url = raw.get("product_url")
+
+        if not product_url:
+            raise ValueError("Missing product_url")
+
+        # Normalize URL for deduplication
+        product_url = product_url.strip().rstrip("/")
+
+        # Skip duplicate books
+        if product_url in seen_urls:
+            continue
+
+        # Price
+        price_text = raw.get("price_text")
+
+        if not price_text:
+            raise ValueError("Missing price_text")
+
+        clean_price = price_text.replace("£", "").strip()
+        price_gbp = float(clean_price)
+
+        # Normalized record
+        normalized_record = {
+            "title": raw.get("title"),
+            "product_url": product_url,
+            "price_text": price_text,
+            "price_gbp": price_gbp,
+            "availability_text": raw.get("availability_text"),
+            "rating_text": raw.get("rating_text"),
+            "description": raw.get("description"),
+            "source_page": raw.get("source_page"),
+            "fetched_at": raw.get("fetched_at")
+        }
+
+        # Validate
+        book = Book.model_validate(normalized_record)
+
+        # Store only after successful validation
+        valid_books.append(book.model_dump(mode="json"))
+
+        # Mark URL as already stored
+        seen_urls.add(product_url)
+
+    except (ValueError, ValidationError, TypeError) as e:
+
+        errors.append({
+            "record": raw,
+            "reason": str(e)
+        })
+
+
+# -------------------------
+# Save books
+# -------------------------
+
+with books_file.open("w", encoding="utf-8") as f:
+    json.dump(valid_books, f, indent=2, ensure_ascii=False)
+
+
+# -------------------------
+# Save errors
+# -------------------------
+
+with errors_file.open("w", encoding="utf-8") as f:
+    json.dump(errors, f, indent=2, ensure_ascii=False)
+
+
+# -------------------------
+# CHECKPOINT
+# -------------------------
+
+print("\n--- STAGE 4 SUMMARY ---")
+print(f"Valid records: {len(valid_books)}")
+print(f"Rejected records: {len(errors)}")
+print(f"Unique URLs: {len(seen_urls)}")
+print(f"Saved to: {books_file}")
+print(f"Errors saved to: {errors_file}")
+
